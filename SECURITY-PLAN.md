@@ -99,13 +99,3 @@ All of these are free and take less than a day total.
 | After launch (basic) | ₹500-800/month |
 | After launch (full security) | ₹800-1,200/month |
 
----
-
-## 7. What This Does Not Cover Yet
-
-These are enterprise-level requirements, not needed for MVP launch:
-
-- Full data encryption at rest
-- GDPR compliance automation
-- Security audit / penetration testing
-- SOC 2 certification
