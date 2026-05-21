@@ -31,7 +31,7 @@ Developer/Admin
 ### Cost
 | Item | Cost |
 |---|---|
-| VPN server (DigitalOcean Droplet 1GB) | $6/month |
+| VPN server (DigitalOcean Droplet 1GB) | $6-$10/month |
 | WireGuard | Free |
 | OpenVPN Access Server (up to 2 users) | Free |
 | Setup time | 4-6 hours |
