@@ -20,8 +20,6 @@ Run a single migration adding all of the following. See `ADMIN_DEVELOPMENT_PLAN.
 |---|---|
 | `AdminUser` | Stores admin credentials + role |
 | `AdminAuditLog` | Every admin action tracked with actor + target |
-| `PhotoReport` | Users reporting abusive photos |
-| `UserReport` | Users reporting abusive accounts |
 | `UserActivityEvent` | Lightweight event log for retention (D1/D7/D30) |
 
 **Fields to add to existing models:**
@@ -41,7 +39,7 @@ acceptedById String?   @map("accepted_by_id")
 
 **Migration checklist:**
 - [ ] Write migration file
-- [ ] Add DB indexes: `users(last_active_at)`, `users(is_suspended)`, `users(created_at)` (if missing), `user_activity_events(user_id, created_at)`, `photo_reports(status, created_at)`, `user_reports(status, created_at)`
+- [ ] Add DB indexes: `users(last_active_at)`, `users(is_suspended)`, `users(created_at)` (if missing), `user_activity_events(user_id, created_at)`
 - [ ] Run migration on staging, verify rollback script
 - [ ] Run migration on production
 
@@ -132,35 +130,7 @@ await prisma.circleInvite.update({
 
 ---
 
-#### 5. Photo/User Report Endpoints (User-Facing)
-
-Users need a way to report content. Add to the main API:
-
-**File:** `src/routes/v1/reports.ts` (new)
-
-```
-POST /api/v1/reports/photos/:photoId   — report a photo
-POST /api/v1/reports/users/:userId     — report a user
-```
-
-**Request body:**
-```json
-{ "reason": "string (max 500 chars)" }
-```
-
-**Validation rules:**
-- Reporter cannot report their own content
-- One report per (reporter, target) pair — upsert or return 409 if duplicate
-- Photo must exist and not be deleted
-- Target user must exist and not be deleted
-
-**Response:** `201 Created` with `{ "reportId": "uuid" }`
-
-All reports land in `PhotoReport` / `UserReport` tables with `status = PENDING`.
-
----
-
-#### 6. User Suspension — Auth Enforcement
+#### 5. User Suspension — Auth Enforcement
 
 **File:** `src/middleware/auth.ts`
 
@@ -190,7 +160,7 @@ if (suspended) return res.status(403).json({ error: 'ACCOUNT_SUSPENDED' });
 
 ---
 
-#### 7. Internal Admin Action Endpoints
+#### 6. Internal Admin Action Endpoints
 
 Add to `src/routes/internal.ts` under `/internal/v1/admin/`:
 
@@ -340,25 +310,7 @@ The app must handle the new `403 ACCOUNT_SUSPENDED` response gracefully.
 
 ---
 
-#### F2. Report Photo / Report User UI
-
-Users need a way to flag content so that admin moderation has data to work with.
-
-**Report Photo:**
-- Add a "Report" option to the photo action sheet (long-press or `...` menu)
-- Opens a bottom sheet with reason options: `Inappropriate content`, `Spam`, `Harassment`, `Other`
-- Calls `POST /api/v1/reports/photos/:photoId`
-- Show success toast: *"Report submitted. We'll review it shortly."*
-- Disable the report button after submission (one report per user per photo)
-
-**Report User:**
-- Add a "Report" option to user profile screens
-- Same reason options + free-text for "Other"
-- Calls `POST /api/v1/reports/users/:userId`
-
----
-
-#### F3. Storage Limit Exceeded Handling
+#### F2. Storage Limit Exceeded Handling
 
 If a user hits their storage cap, the API returns a `413` or storage-specific error. Make sure the app:
 - Shows a clear message: *"You've reached your storage limit."*
@@ -367,7 +319,7 @@ If a user hits their storage cap, the API returns a `413` or storage-specific er
 
 ---
 
-#### F4. AI Quota Exceeded — Clear Messaging
+#### F3. AI Quota Exceeded — Clear Messaging
 
 The quota exceeded response already exists. Verify the app shows distinct messages for:
 - Chat quota exceeded vs Caption quota exceeded
@@ -378,7 +330,7 @@ The quota exceeded response already exists. Verify the app shows distinct messag
 
 ### P1 — Important Before Launch
 
-#### F5. Onboarding Step Completion Signal
+#### F4. Onboarding Step Completion Signal
 
 For the admin onboarding drop-off metric to be accurate, the FE must complete the full onboarding flow and call the final answer submission endpoint. Verify:
 - Every onboarding screen's "Next" button calls `POST /api/v1/onboarding/answers`
@@ -387,7 +339,7 @@ For the admin onboarding drop-off metric to be accurate, the FE must complete th
 
 ---
 
-#### F6. Upload Failure User Feedback
+#### F5. Upload Failure User Feedback
 
 When a photo upload fails (the worker sets `status = FAILED`), the app needs to surface this:
 - The app should poll or use push notifications to detect failed uploads
@@ -398,7 +350,7 @@ Currently, if the app doesn't poll `GET /memories` for FAILED status photos, the
 
 ---
 
-#### F7. Device Platform Reporting on FCM Token Registration
+#### F6. Device Platform Reporting on FCM Token Registration
 
 When registering FCM tokens, the `platform` field on `FcmDeviceToken` should be set (`ios` or `android`). This helps admin filter push notification data by platform.
 
@@ -416,7 +368,7 @@ await api.post('/notifications/register-token', {
 
 ### P2 — Can Follow Shortly After Launch
 
-#### F8. In-App Admin Warning Notification
+#### F7. In-App Admin Warning Notification
 
 When an admin warns a user, a push notification will be sent with type `ADMIN_WARNING`. The app should:
 - Display it as a system-style notification (different styling than social notifications)
@@ -435,10 +387,8 @@ When an admin warns a user, a push notification will be sent with type `ADMIN_WA
 5. **FE:** Suspension error handling screen
 
 ### Sprint 2 (Enables core admin modules)
-1. **BE:** Photo/user report endpoints + validation
-2. **BE:** Internal admin action endpoints (suspend, delete, storage grant)
-3. **BE:** Redis suspension denylist in auth middleware
-4. **FE:** Report photo + report user UI
+1. **BE:** Internal admin action endpoints (suspend, delete, storage grant)
+2. **BE:** Redis suspension denylist in auth middleware
 
 ### Sprint 3 (Enables analytics modules)
 1. **BE:** Storage index migration
