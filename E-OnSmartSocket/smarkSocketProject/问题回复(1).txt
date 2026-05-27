@@ -1,0 +1,222 @@
+中央服务器 – 集成要求
+
+本文档概述了与您管理充电桩/充电插座的中央服务器（通过OCPP 1.6协议）进行通信时的关键集成问题及示例期望。
+
+1.通信模型
+● 我们如何与该中央服务器集成？
+○ REST API（HTTPS）
+○ WebSocket（OCPP/ws/wss）
+○ 两者都支持？
+
+答：
+我们只支持WebSocket（OCPP/ws/wss）
+
+
+如果提供REST API：
+
+● 您是否提供包含可用API列表的Postman集合或Swagger（OpenAPI）规范文档？
+● 基础URL是什么？（例如：https://api.vendor.com/v1/）
+● 是否存在调用频率限制（每分钟/每小时请求数量）？
+
+答：
+我们不提供API
+
+
+如果提供WebSocket：
+
+● OCPP端点是什么？（例如：wss://ws.vendor.com/ocpp）
+
+答：
+我们使用的url为：wss://cpcomm.x-cheng.com/ocpp（这个是我们自己平台的）
+
+
+● 发布哪些事件？（需提供JSON负载格式）
+
+答：
+1.Boot Notification
+充电桩上电会发送认证消息，掉线再次上线也会发送上电消息，上电消息参考格式如下：
+[2, "00001ab8-0000-b4f5-5c56-f9eb857c27fe", "BootNotification", {"chargePointModel": "Vendor@7KW", "chargePointSerialNumber": "202112141099", "chargePointVendor": "Vendor", "firmwareVersion": "V1.2@dec40b4+66,F0.gl,ws,ESP32", "iccid": "", "imsi": ""}]
+[3,"00001ab8-0000-b4f5-5c56-f9eb857c27fe",{"status":"Accepted","currentTime":"2021-12-16T01:18:04.927Z","interval":300}]
+
+2.Authorize
+当充电桩需要后台认证信息时，会向后台发送Authorize请求，充电桩会根据后台认证返回的信息决定是否启动。
+[2, "0002dbe0-61c0-2c4c-9bca-c8dce13dc4c4", "Authorize", {"idTag": "DD0A0160"}]
+[3,"0002dbe0-61c0-2c4c-9bca-c8dce13dc4c4",{"idTagInfo":{"status":"Expired","expiryDate":"2021-12-14T13:05:00.000Z"}}]
+当使能离线认证时，充电桩可以在离线的情况下对IC卡进行认证，在一些网络不太好或私人使用的场景下，离线认证会带来使用的便捷性。
+
+3.Meter Values
+充电桩工作电压、电流、电量和文档等信息是通过Meter Values发送到后台，为了考虑部分后台兼容问题，充电桩实现了两种 ReadingContext的MeterValues，空闲时间，主要上报Sample.Clock类型，如下：
+[2, "000bf82e-61bd-5cc0-47d2-775078ff8e15", "MeterValues", {"connectorId": 1, "meterValue": [{"timestamp": "2021-12-18T04:00:00.000Z", "sampledValue": [{"value": "0.00", "context": "Sample.Clock", "measurand": "Current.Import", "phase": "L1", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Sample.Clock", "measurand": "Current.Import", "phase": "L2", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Sample.Clock", "measurand": "Current.Import", "phase": "L3", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Sample.Clock", "measurand": "Energy.Active.Import.Interval", "location": "Inlet", "unit": "kWh"}, {"value": "0.0", "context": "Sample.Clock", "measurand": "Power.Active.Import", "location": "Inlet", "unit": "W"}, {"value": "27.00", "context": "Sample.Clock", "measurand": "Temperature", "location": "Inlet", "unit": "Celsius"}, {"value": "239.94", "context": "Sample.Clock", "measurand": "Voltage", "phase": "L1", "location": "Inlet", "unit": "V"}, {"value": "0.16", "context": "Sample.Clock", "measurand": "Voltage", "phase": "L2", "location": "Inlet", "unit": "V"}, {"value": "0.15", "context": "Sample.Clock", "measurand": "Voltage", "phase": "L3", "location": "Inlet", "unit": "V"}]}]}]
+I (786101) XCProt: WS>> [3,"000bf82e-61bd-5cc0-47d2-775078ff8e15",{}]
+在充电时，除了会上报Sample.Clock报文外，还会在事务开始，事务结束，事务中间上报如下MeterValues：
+[2, "00034d1e-61bd-7e4e-7345-de46fae07cea", "MeterValues", {"connectorId": 1, "meterValue": [{"timestamp": "2021-12-18T06:23:10.000Z", "sampledValue": [{"value": "0.00", "context": "Transaction.Begin", "measurand": "Current.Import", "phase": "L1", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Transaction.Begin", "measurand": "Current.Import", "phase": "L2", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Transaction.Begin", "measurand": "Current.Import", "phase": "L3", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Transaction.Begin", "measurand": "Energy.Active.Import.Register", "location": "Inlet", "unit": "kWh"}, {"value": "0.0", "context": "Transaction.Begin", "measurand": "Power.Active.Import", "location": "Inlet", "unit": "W"}, {"value": "55.00", "context": "Transaction.Begin", "measurand": "Temperature", "location": "Inlet", "unit": "Celsius"}, {"value": "240.91", "context": "Transaction.Begin", "measurand": "Voltage", "phase": "L1", "location": "Inlet", "unit": "V"}, {"value": "0.17", "context": "Transaction.Begin", "measurand": "Voltage", "phase": "L2", "location": "Inlet", "unit": "V"}, {"value": "0.16", "context": "Transaction.Begin", "measurand":"Voltage", "phase": "L3", "location": "Inlet", "unit": "V"}]}]}]
+[3,"00034d1e-61bd-7e4e-7345-de46fae07cea",{}]
+[2, "00034f6c-61bd-7e4f-a31c-2041fde43487", "MeterValues", {"connectorId": 1, "transactionId": 464, "meterValue": [{"timestamp": "2021-12-18T06:23:11.000Z", "sampledValue": [{"value": "0.00", "context": "Sample.Periodic", "measurand": "Current.Import", "phase": "L1", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Sample.Periodic", "measurand": "Current.Import", "phase": "L2", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Sample.Periodic", "measurand": "Current.Import", "phase": "L3", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Sample.Periodic", "measurand": "Energy.Active.Import.Register", "location": "Inlet", "unit": "kWh"}, {"value": "0.0", "context": "Sample.Periodic", "measurand": "Power.Active.Import", "location": "Inlet", "unit": "W"}, {"value": "55.00", "context": "Sample.Periodic", "measurand": "Temperature", "location": "Inlet", "unit": "Celsius"}, {"value": "241.01", "context": "Sample.Periodic", "measurand": "Voltage", "phase": "L1", "location": "Inlet", "unit": "V"}, {"value": "0.18", "context": "Sample.Periodic", "measurand": "Voltage", "phase": "L2", "location": "Inlet", "unit": "V"}, {"value": "0.16", "context": "Sample.Periodic", "measura
+nd": "Voltage", "phase": "L3", "location": "Inlet", "unit": "V"}]}]}]
+[3,"00034f6c-61bd-7e4f-a31c-2041fde43487",{}]
+[2, "0003dacc-61bd-7e73-275b-f733ad850f5c", "MeterValues", {"connectorId": 1, "meterValue": [{"timestamp": "2021-12-18T06:23:47.000Z", "sampledValue": [{"value": "0.00", "context": "Transaction.End", "measurand": "Current.Import", "phase": "L1", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Transaction.End", "measurand": "Current.Import", "phase": "L2", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Transaction.End", "measurand": "Current.Import", "phase": "L3", "location": "Inlet", "unit": "A"}, {"value": "0.00", "context": "Transaction.End", "measurand": "Energy.Active.Import.Register", "location": "Inlet", "unit": "kWh"}, {"value": "0.0", "context": "Transaction.End", "measurand": "Power.Active.Import", "location": "Inlet", "unit": "W"}, {"value": "59.00", "context": "Transaction.End", "measurand": "Temperature", "location": "Inlet", "unit": "Celsius"}, {"value": "240.90", "context": "Transaction.End", "measurand": "Voltage", "phase": "L1", "location": "Inlet", "unit": "V"}, {"value": "0.19", "context": "Transaction.End", "measurand": "Voltage", "phase": "L2", "location": "Inlet", "unit": "V"}, {"value": "0.17", "context": "Transaction.End", "measurand": "Voltage", "phase
+": "L3", "location": "Inlet", "unit": "V"}]}]}]
+[3,"0003dacc-61bd-7e73-275b-f733ad850f5c",{}]
+
+4.Start Transaction
+当充电离线时，充电桩本身会缓存事务，且在充电桩在线后，也是通过StartTransaction和StopTransaction来上报离线事务的。
+[2, "000104c8-61c0-352c-bb4e-e8e69de33814", "StartTransaction", {"connectorId": 1, "idTag": "703F180B", "meterStart": 0, "timestamp": "2021-12-20T07:47:55.000Z"}]
+[3,"000104c8-61c0-352c-bb4e-e8e69de33814",{"transactionId":504,"idTagInfo":{"status":"Accepted","expiryDate":"2021-12-20T08:47:57.359Z"}}]
+
+5.Stop Transaction
+当充电桩停止充电时，充电桩会上报StopTransaction，StartTransaction和StopTransaction总是成对使用的，后台应该使用meterStart和meterStop来跟踪充电桩的电能使用情况。
+[2, "00082924-61c0-3700-b880-81e696cbe768", "StopTransaction", {"idTag": "703F180B", "meterStop": 100, "timestamp": "2021-12-20T07:55:44.000Z", "transactionId": 504, "reason": "Local"}]
+[3,"00082924-61c0-3700-b880-81e696cbe768",{"idTagInfo":{"status":"Accepted","expiryDate":"2021-12-20T08:55:45.433Z"}}]
+
+6.Status Notification
+充电桩状态发生变化时，总是会尝试上报StatusNotification。
+[2, "00082514-61c0-36ff-73f4-debeafad91f8", "StatusNotification", {"connectorId": 1, "errorCode": "NoError", "info": "", "status": "Finishing", "vendorId": ""}]
+[3,"00082514-61c0-36ff-73f4-debeafad91f8",{}]
+
+7.Diagnostics Status Notification
+当上传诊断信息时，充电桩会主动上报DiagnosticsStatusNotification，如果后台需要更多的中间状态，应该使用Trigger获取当前上送日志的实时状态。
+[2, "000872a8-61ce-7bb1-69c7-413f12fa2f12", "DiagnosticsStatusNotification", {"status": "Idle"}]
+[3,"000872a8-61ce-7bb1-69c7-413f12fa2f12",{}]
+
+8.Firmware Status Notification
+当充电桩进行升级更新时，充电桩会主动上报FirmwareStatusNotification，如果后台需要更多的中间状态，应该使用Trigger获取当前升级的实时状态。
+[2, "000969d8-61ce-7bf0-e1e7-d4905b34e08a", "FirmwareStatusNotification", {"status": "Idle"}]
+[3,"000969d8-61ce-7bf0-e1e7-d4905b34e08a",{}]
+
+9.Data Transfer
+如果需要获取更多非OCPP1.6所定义的信息和功能，可以使用DataTransfer功能，此功能需要和供应商定制。
+
+10.Heartbeat
+心跳用于保持充电桩和后台之间的连接，任何其它消息的有效交互，均会导致心跳时间的刷新。
+[2, "0010a478-61c0-392c-cba0-dcfafd8be677", "Heartbeat", {}]
+[3,"0010a478-61c0-392c-cba0-dcfafd8be677",{"currentTime":"2021-12-20T08:05:01.225Z"}]
+[2, "0015392a-61c0-3a58-b6dd-69ae1bbb364b", "Heartbeat", {}]
+[3,"0015392a-61c0-3a58-b6dd-69ae1bbb364b",{"currentTime":"2021-12-20T08:10:01.439Z"}]
+
+11.Change Availability
+充电桩支持后台改变桩的可用性，当充电桩不在Available状态时，会等待充电桩为Available时才会调整状态。
+
+本充电桩均只支持一个枪头，故ConnectorId为0和1效果一致。
+基本款充电桩不支持状态改变持久化；
+智能款充电桩支持状态改变持久化。
+和可用相关测交互参考如下：
+[2,"d5fb943a-fc29-4fa6-ab92-a34549ba540a","RemoteStartTransaction",{"connectorId":1,"idTag":"703F180B"}]
+[3, "d5fb943a-fc29-4fa6-ab92-a34549ba540a", {"status": "Accepted"}]
+[2, "0054c626-61c0-5065-36f5-f62fecdbb94a", "StatusNotification", {"connectorId": 1, "errorCode": "NoError", "info": "", "status": "Preparing", "vendorId": ""}]
+[3,"0054c626-61c0-5065-36f5-f62fecdbb94a",{}]
+[2, "0054ccac-61c0-5067-02ee-2e750355a90c", "StatusNotification", {"connectorId": 1, "errorCode": "NoError", "info": "", "status": "Charging", "vendorId": ""}]
+[3,"0054ccac-61c0-5067-02ee-2e750355a90c",{}]
+[2, "0054d1fc-61c0-5068-4696-6d83efddee17", "StartTransaction", {"connectorId": 1, "idTag": "703F180B", "meterStart": 0, "timestamp": "2021-12-20T09:44:08.000Z"}]
+[3,"0054d1fc-61c0-5068-4696-6d83efddee17",{"transactionId":509,"idTagInfo":{"status":"Accepted","expiryDate":"2021-12-20T10:44:09.143Z"}}]
+[2,"58b72f65-0f57-4234-8df1-71be9aad967c","ChangeAvailability",{"connectorId":1,"type":"Inoperative"}]
+[3, "58b72f65-0f57-4234-8df1-71be9aad967c", {"status": "Scheduled"}]
+[3,"00550c6c-61c0-5077-06d9-b211d4a25be8",{}]
+[2, "00550dca-61c0-5077-0e65-b2f8c6d09962", "StopTransaction", {"idTag": "703F180B", "meterStop": 0, "timestamp": "2021-12-20T09:44:23.000Z", "transactionId": 509, "reason": "Local"}]
+[3,"00550dca-61c0-5077-0e65-b2f8c6d09962",{"idTagInfo":{"status":"Accepted","expiryDate":"2021-12-20T10:44:24.447Z"}}]
+[2, "00554772-61c0-5086-8897-84149223cdec", "StatusNotification", {"connectorId": 1, "errorCode": "NoError", "info": "", "status": "Unavailable", "vendorId": ""}]
+[3,"00554772-61c0-5086-8897-84149223cdec",{}]
+[2,"65603290-d6d9-48b1-a588-b225f3ce678a","ChangeAvailability",{"connectorId":1,"type":"Operative"}]
+[3, "65603290-d6d9-48b1-a588-b225f3ce678a", {"status": "Accepted"}]
+[2, "00556234-61c0-508d-021b-3bf4d3dcd03f", "StatusNotification", {"connectorId": 1, "errorCode": "NoError", "info": "", "status": "Available", "vendorId": ""}]
+[3,"00556234-61c0-508d-021b-3bf4d3dcd03f",{}]
+
+12.Change Configuration
+充电桩支持对非Readonly的参数进行修改，以便充电桩适用于更多的场景；所有的参数信息，参考下面的配置说明。
+
+例如调整充电桩最大工作电流：
+[2,"d32e78d4-a26e-4ff0-b3bd-45a0921fc5e7","ChangeConfiguration",{"key":"VendorMaxWorkCurrent","value":"31"}]
+[3, "d32e78d4-a26e-4ff0-b3bd-45a0921fc5e7", {"status": "Accepted"}]
+
+13.Reserve Now
+预约，充电桩支持提前预约功能，在预约到期之前，仅仅预约的IdTag可以启动充电。
+[2,"2a29ff8c-4b9f-4c23-bece-5c21ea8fbe38","ReserveNow",{"connectorId":1,"expiryDate":"2021-12-20T09:05:00.000Z","idTag":"703F180B","reservationId":60}]
+[3, "2a29ff8c-4b9f-4c23-bece-5c21ea8fbe38", {"status": "Accepted"}]
+[2, "002e87e0-61c0-469b-ad0a-6d3de4b3dd4b", "StatusNotification", {"connectorId": 1, "errorCode": "NoError", "info": "", "status": "Reserved", "vendorId": ""}]
+[3,"002e87e0-61c0-469b-ad0a-6d3de4b3dd4b",{}]
+[2,"e1d23346-1f24-42b5-b5f5-30cc5b887114","RemoteStartTransaction",{"connectorId":1,"idTag":"7A560D0A"}]
+[3, "e1d23346-1f24-42b5-b5f5-30cc5b887114", {"status": "Rejected"}]
+[2,"d556a6d5-2227-4a60-8415-4a8118db1e3c","RemoteStartTransaction",{"connectorId":1,"idTag":"703F180B"}]
+[3, "d556a6d5-2227-4a60-8415-4a8118db1e3c", {"status": "Accepted"}]
+
+预约仅仅能在桩处于可用状态下进行，如果上一个用户在结束完充电后，并没有拔枪，即充电桩处于Finish状态，充电桩将无法进行预约。
+
+
+等等........ 上面至少部分的交互指令，具体请查看OCPP1.6-J相关文档
+
+
+
+● 我们能否订阅特定通道（按充电插座/按区域）？
+
+答：
+不支持
+
+
+
+2.认证与请求头
+● 需要使用哪种认证方式？
+○ API密钥（在请求头中）
+○ JWT令牌？
+
+示例（REST）：
+
+GET /sessions/active HTTP/1.1
+Host: api.vendor.com
+Authorization: Bearer <ACCESS_TOKEN>
+Content-Type: application/json
+
+示例（OCPP）：
+const ws = new WebSocket("wss://ws.vendor.com/ocpp?token=<ACCESS_TOKEN>");
+ws.onmessage = (event) => {
+    console.log("收到消息:", JSON.parse(event.data));
+};
+
+答：
+为什么使用的认证方式是通过充电桩去匹配
+wss://ws.vendor.com/ocpp/12345678910
+只有这个12345678910，属于后台白名单 才可以正常连接后台
+
+
+
+3.必需的功能性端点/事件（仅为文档应包含内容的示例）
+🔹 会话控制
+操作	API（REST）示例	OCPP 事件示例
+启动会话	POST /session/start<br> 请求体: { "socketId": "SOCK123", "userId": "USR789" }	{ "event": "session.start", "socketId": "SOCK123", "userId": "USR789" 
+停止会话	POST /session/stop<br> 请求体: { "sessionId": "SES456" }	{ "event": "session.stop", "sessionId": "SES456" }
+管理员强制停止	
+POST
+请求体: 
+/session/adminStop	
+{ "event": "session.adminStop", "reason": "maintenance" }
+
+
+🔹 充电桩使用数据
+数据类型	API 端点示例	OCPP 事件示例
+实时使用情况	GET /sockets/{id}/usage	{ "event": "usage.update", "socketId": "SOCK123", "kWh": 2.5, "power": 3.2 }
+充电桩ID与位置（活跃会话）	GET /sockets	{ "event": "socket.info", "id": "SOCK123", "location": "Block A" }
+当前费用	GET /sessions/{id}/cost	{ "event": "session.cost", "sessionId": "SES456", "cost": 10.5 }
+状态（使用中/空闲/故障）	GET /sockets/{id}/status	{ "event": "socket.status", "id": "SOCK123", "status": "InUse" }
+
+答：
+我们不支持Api方式，具体使用方式请看1章节的回答
+
+
+
+4.离线模式
+● 如果中央服务器宕机，充电桩是否可以：
+○ 仍支持本地运行（离线模式）？
+○ 在本地缓存数据，并在网络恢复后同步？
+○ 必须由中央服务器批准每个充电会话才能启动？
+
+答：
+支持离线模式，能够做到在本地缓存数据，并在网络恢复后同步
+必须由中央服务器批准每个充电会话才能启动（是的）
+
+
+
+5.供应商需提供的交付内容
+API/OCPP 集成文档（例如：Swagger 文档、Postman 集合、事件数据格式说明）
+认证信息（API密钥、令牌等）
+错误码说明及重试策略
+
+答：
+没有API，我们是根据OCPP1.6官方文档去写的
