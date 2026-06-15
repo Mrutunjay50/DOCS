@@ -3,6 +3,7 @@
 Visual companion to [ARCHITECTURE.md](ARCHITECTURE.md). Every diagram is **Mermaid** — it renders in VS Code's Markdown preview (with the Mermaid extension) and on GitHub. Read top to bottom: from the 10,000-ft system map down to sequences, data, and the build timeline.
 
 > Backend: **Node 20 + Express** gateway · **Django 5 + DRF + Celery** processing engine.
+> Security model: **JWT** auth throughout; files encrypted at rest via **S3 SSE-S3** + TLS in transit (no KMS envelope encryption). Django kept private by **security-group rules**, not a separate private subnet.
 
 ---
 
@@ -19,21 +20,18 @@ flowchart TB
     end
 
     GW{{"🚪 Express Gateway<br/>api-node<br/>— the ONLY public API —"}}
-    DJ["⚙️ Django Engine<br/>OCR · Translate · Image→PDF<br/>— private, never public —"]
+    DJ["⚙️ Django Engine<br/>OCR · Translate · Image→PDF<br/>— SG-restricted, not public —"]
 
     EXT1["💳 Razorpay"]
     EXT2["🔤 Google Vision / Textract<br/>Google / DeepL"]
     EXT3["✉️ Resend / SES · MSG91"]
-    EXT4["🔐 AWS KMS"]
-    EXT5["🪣 S3 + CloudFront"]
+    EXT5["🪣 S3 (SSE-S3) + CloudFront"]
 
-    U1 -- "access token" --> GW
-    U2 -- "admin token · TOTP · IP-allow" --> GW
+    U1 -- "JWT access token" --> GW
+    U2 -- "admin JWT · TOTP · IP-allow" --> GW
     GW -- "HMAC-signed<br/>service token" --> DJ
     GW <--> EXT1
     GW <--> EXT3
-    GW -- "GenerateDataKey (encrypt)" --> EXT4
-    DJ -- "Decrypt (worker only)" --> EXT4
     DJ <--> EXT2
     GW <--> EXT5
     DJ <--> EXT5
@@ -45,7 +43,7 @@ flowchart TB
     class U1,U2 client;
     class GW gateway;
     class DJ engine;
-    class EXT1,EXT2,EXT3,EXT4,EXT5 ext;
+    class EXT1,EXT2,EXT3,EXT5 ext;
 ```
 
 ---
@@ -96,7 +94,7 @@ flowchart TB
             n4[10 Platform Ops]
         end
         subgraph MID["middleware spine"]
-            x1{{auth + org ctx}}
+            x1{{JWT auth + org ctx}}
             x2{{tier policy}}
             x3{{rate limit}}
             x4{{error envelope}}
@@ -111,7 +109,7 @@ flowchart TB
         d4{{service-token auth}}
     end
 
-    T1 -- "api-client · token" --> MID
+    T1 -- "api-client · JWT" --> MID
     PUB --> m5
     m5 -- "ProcessingClient<br/>HMAC + X-User-Tier" --> d4
     m6 -. "scanned PDF→DOC<br/>fallback only" .-> d4
@@ -127,36 +125,34 @@ flowchart TB
 
 ---
 
-## 3. The privacy boundary — KMS envelope encryption
+## 3. Document lifecycle & privacy
 
-Why "staff cannot read your documents" is true: it's IAM, not a checkbox in code. Note the three lanes can each touch KMS — but only the worker holds `Decrypt`.
+Files are encrypted at rest by **S3 SSE-S3** (AES-256, S3-managed) and travel over TLS. Admins are restricted to metadata by **application + JWT scope policy**. Everything is deleted at 24h.
 
 ```mermaid
 flowchart LR
-    subgraph ingress["① UPLOAD — api-node-role"]
+    subgraph ingress["① UPLOAD"]
         direction TB
-        i1[Client uploads<br/>over TLS] --> i2[KMS<br/>GenerateDataKey]
-        i2 --> i3[Encrypt file<br/>with data key]
-        i3 --> i4[(S3: ciphertext)]
-        i2 --> i5[(Job: encrypted<br/>data key + SHA-256)]
+        i1[Client uploads<br/>over TLS] --> i2[Gateway validates<br/>JWT + tier]
+        i2 --> i3[(S3 SSE-S3<br/>encrypted at rest)]
+        i2 --> i5[(Job/JobRef:<br/>metadata + SHA-256)]
     end
 
-    subgraph work["② PROCESS — worker-role 🔓"]
+    subgraph work["② PROCESS — worker"]
         direction TB
-        w1[KMS Decrypt<br/>the data key] --> w2[Decrypt file<br/>in memory]
-        w2 --> w3[OCR / Translate]
-        w3 --> w4[Re-encrypt result<br/>· discard plaintext]
+        w1[Fetch object from S3] --> w2[OCR / Translate<br/>in memory]
+        w2 --> w3[Store result<br/>in S3 SSE-S3]
     end
 
-    subgraph admin["③ ADMIN — admin-role 🚫"]
+    subgraph admin["③ ADMIN — metadata only"]
         direction TB
         ad1[Reads JobRef<br/>metadata + SHA-256]
-        ad2[/NO kms:Decrypt<br/>cannot read content/]
+        ad2[/Policy: no content access<br/>· no download path/]
     end
 
     subgraph kill["④ DELETE @ 24h"]
         direction TB
-        k1[Delete data key<br/>= crypto-shred] --> k2[Ciphertext now<br/>unrecoverable] --> k3[Delete S3 object]
+        k1[S3 lifecycle rule] --> k2[Celery-beat sweep] --> k3[Object + record removed]
     end
 
     ingress ==> work
@@ -166,16 +162,17 @@ flowchart LR
     classDef ok fill:#DCFCE7,stroke:#16A34A,color:#14532D;
     classDef no fill:#FEE2E2,stroke:#DC2626,color:#7F1D1D;
     classDef neutral fill:#F1F5F9,stroke:#64748B,color:#1E293B;
-    class w1,w2,w3,w4 ok;
+    class w1,w2,w3 ok;
     class ad2 no;
-    class i1,i2,i3,i4,i5,k1,k2,k3,ad1 neutral;
+    class i1,i2,i3,i5,k1,k2,k3,ad1 neutral;
 ```
 
-| Role | `GenerateDataKey` | `Decrypt` |
-|---|:---:|:---:|
-| `worker-role` (celery + workers-node) | ✅ | ✅ |
-| `api-node-role` | ✅ | ❌ |
-| `admin` paths | ❌ | ❌ |
+| Concern | Mechanism |
+|---|---|
+| At rest | S3 SSE-S3 (AES-256, S3-managed keys); RDS + ElastiCache encryption on |
+| In transit | TLS everywhere (ACM on the ALB; internal TLS to Django) |
+| Admin content lockout | application policy + JWT scope — admins have **no download route**, metadata only |
+| Retention | 24h S3 lifecycle + Celery-beat sweep |
 
 ---
 
@@ -186,17 +183,14 @@ sequenceDiagram
     autonumber
     participant C as 🖥️ web-b2c
     participant N as 🚪 Express Gateway
-    participant K as 🔐 KMS
-    participant S as 🪣 S3
+    participant S as 🪣 S3 (SSE-S3)
     participant D as ⚙️ Django (DRF)
     participant Q as 🔁 Celery Worker
 
     C->>N: POST /api/tools/translate (file, lang pair)
     activate N
-    N->>N: auth middleware · tier policy check
-    N->>K: GenerateDataKey
-    K-->>N: plaintext + encrypted key
-    N->>S: store ciphertext
+    N->>N: JWT auth middleware · tier policy check
+    N->>S: store upload (encrypted at rest)
     N->>D: ProcessingClient (HMAC-signed) /api/v1/translate/
     activate D
     D->>D: verify service token
@@ -214,10 +208,9 @@ sequenceDiagram
     end
 
     activate Q
-    Q->>K: Decrypt data key (only role that can)
-    Q->>S: fetch ciphertext → decrypt in memory
+    Q->>S: fetch object → process in memory
     Q->>Q: OCR (if scan) → translate → Devanagari export
-    Q->>S: store re-encrypted result
+    Q->>S: store result
     Q->>N: completion webhook → refresh JobRef
     deactivate Q
 
@@ -225,12 +218,14 @@ sequenceDiagram
     N->>S: mint short-lived signed URL
     N-->>C: 302 → signed URL (client never reaches Django)
 
-    Note over S: @ 24h — Celery-beat + S3 lifecycle crypto-shred
+    Note over S: @ 24h — S3 lifecycle + Celery-beat sweep delete the object
 ```
 
 ---
 
 ## 5. Trust boundaries — what each token can do
+
+No separate private subnet — Django and the data stores live in the same network but are reachable **only** via security-group rules that name the `api-node` security group as the sole source.
 
 ```mermaid
 flowchart TB
@@ -238,10 +233,10 @@ flowchart TB
         c1[web-b2c]
         c2[web-admin]
     end
-    subgraph z2["🚪 GATEWAY ZONE — public subnet"]
+    subgraph z2["🚪 GATEWAY — ALB-fronted"]
         g1[api-node<br/>Express]
     end
-    subgraph z3["🔒 PRIVATE ZONE — private subnet"]
+    subgraph z3["🔒 SG-RESTRICTED — not on the ALB"]
         p1[api-django]
         p2[celery-workers]
         p3[workers-node]
@@ -252,7 +247,7 @@ flowchart TB
 
     c1 -- "user JWT<br/>aud: user" --> g1
     c2 -- "admin JWT<br/>aud: admin + TOTP + IP-allow" --> g1
-    g1 -- "HMAC + short-TTL<br/>+ X-User-Id/Tier" --> p1
+    g1 -- "HMAC + short-TTL<br/>+ X-User-Id/Tier · SG-allowed" --> p1
     g1 --> db1
     g1 --> rd
     p1 --> db2
@@ -261,7 +256,7 @@ flowchart TB
     p2 --> rd
     p3 --> rd
 
-    note1["❌ user token never valid on /admin/*<br/>❌ admin token never valid on B2C<br/>❌ nothing but api-node can reach Django<br/>✅ ownership check on every resource (no IDOR)"]
+    note1["❌ user token never valid on /admin/*<br/>❌ admin token never valid on B2C<br/>❌ only api-node's SG can reach Django + data stores<br/>✅ ownership check on every resource (no IDOR)"]
     g1 -.- note1
 
     classDef pub fill:#FEF3C7,stroke:#D97706,color:#78350F;
@@ -329,7 +324,7 @@ erDiagram
         string user_id "from Node"
         string tier
         string sha256
-        blob encrypted_data_key
+        string s3_key
         datetime expires_at
     }
     INVOICE {
@@ -348,30 +343,30 @@ erDiagram
 
 ## 7. AWS deployment topology
 
+No dedicated private subnet tier — every service runs in the same subnets behind the VPC, and **security groups** enforce that only `api-node` reaches Django and the data stores. Only the public-facing services are attached to the ALB.
+
 ```mermaid
 flowchart TB
     NET((🌐 Internet)) --> CF[CloudFront CDN<br/>static + signed downloads]
     CF --> ALB[Application Load Balancer<br/>ACM TLS · WAF]
 
     subgraph VPC["VPC · ≥2 AZs"]
-        subgraph PUBSUB["🟢 PUBLIC subnets"]
+        subgraph EDGE["🟢 ALB-fronted services"]
             ALB --> f1[ECS: web-b2c]
             ALB --> f2[ECS: web-admin]
             ALB --> f3[ECS: api-node · Express]
         end
-        subgraph PRIVSUB["🔒 PRIVATE subnets"]
+        subgraph INT["🔒 SG-restricted services (not on ALB)"]
             f3 --> w1[ECS: workers-node<br/>BullMQ]
             f3 --> w2[ECS: api-django]
             w2 --> w3[ECS: celery-workers<br/>heavy image]
         end
-        subgraph DATA["💾 DATA layer"]
-            rds1[(RDS: node-db)]
-            rds2[(RDS: django-db)]
-            ec[(ElastiCache Redis<br/>cluster)]
-            s3[(S3: uploads/results/exports<br/>SSE-KMS · 24h lifecycle)]
-            kms[(AWS KMS<br/>CMK + per-file keys)]
+        subgraph DATA["💾 DATA layer (SG-restricted)"]
+            rds1[(RDS: node-db · encrypted)]
+            rds2[(RDS: django-db · encrypted)]
+            ec[(ElastiCache Redis<br/>encrypted)]
+            s3[(S3: uploads/results/exports<br/>SSE-S3 · 24h lifecycle)]
         end
-        NAT[NAT Gateway<br/>worker egress]
     end
 
     f3 --> rds1
@@ -379,9 +374,8 @@ flowchart TB
     w2 --> rds2
     w1 & w2 & w3 --> ec
     w3 --> s3
-    w3 --> kms
     f3 --> s3
-    w3 -. "cloud OCR/translate APIs" .-> NAT
+    w3 -. "cloud OCR/translate APIs" .-> NET
 
     classDef pub fill:#DCFCE7,stroke:#16A34A,color:#14532D;
     classDef priv fill:#E0E7FF,stroke:#4338CA,color:#312E81;
@@ -389,8 +383,8 @@ flowchart TB
     classDef edge fill:#F1F5F9,stroke:#64748B,color:#1E293B;
     class f1,f2,f3 pub;
     class w1,w2,w3 priv;
-    class rds1,rds2,ec,s3,kms data;
-    class CF,ALB,NAT,NET edge;
+    class rds1,rds2,ec,s3 data;
+    class CF,ALB,NET edge;
 ```
 
 ---
@@ -431,7 +425,7 @@ gantt
     axisFormat %s
 
     section Foundations
-    Step 0 · monorepo, CI/CD, KMS+IAM, bridge, auth, BullMQ/Celery   :done, s0, 0, 2
+    Step 0 · monorepo, CI/CD, bridge, JWT auth, BullMQ/Celery        :done, s0, 0, 2
 
     section Free-tier core
     Step 1 · auth, OCR + pre-processing, B2C dashboard              :active, s1, 2, 3
@@ -488,7 +482,7 @@ flowchart TB
         dj2[premium adapters]
     end
     subgraph DO["🟦 DevOps — leads foundations, then floats"]
-        do1[infra + KMS + CI/CD + images]
+        do1[infra + SG model + CI/CD + images]
         do2[E2E/load harness + admin CRUD assist]
     end
 
