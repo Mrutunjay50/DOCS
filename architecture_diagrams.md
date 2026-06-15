@@ -219,7 +219,7 @@ erDiagram
 
 ## 5. AWS deployment topology
 
-Compute runs on **EC2** (Auto Scaling Groups, one per service role). All instances sit in one VPC; the ALB fronts the web and API instances, and the workers + Django consume jobs from RabbitMQ.
+Compute runs on **EC2** (Auto Scaling Groups, one per service role). All instances sit in one VPC; the ALB fronts the API, and the workers + Django consume jobs from RabbitMQ.
 
 ```mermaid
 flowchart TB
@@ -228,8 +228,6 @@ flowchart TB
 
     subgraph VPC["VPC · ≥2 AZs"]
         subgraph EC2["🖥️ EC2 — Auto Scaling Groups"]
-            ALB --> f1[EC2: web-b2c]
-            ALB --> f2[EC2: web-admin]
             ALB --> f3[EC2: api-node · Express]
             f3 --> w1[EC2: workers-node<br/>RabbitMQ consumers]
             f3 --> w2[EC2: api-django]
@@ -256,7 +254,7 @@ flowchart TB
     classDef pub fill:#DCFCE7,stroke:#16A34A,color:#14532D;
     classDef data fill:#FEF9C3,stroke:#CA8A04,color:#713F12;
     classDef edge fill:#F1F5F9,stroke:#64748B,color:#1E293B;
-    class f1,f2,f3,w1,w2,w3 pub;
+    class f3,w1,w2,w3 pub;
     class rds1,rds2,ec,s3,mq data;
     class CF,ALB,NET edge;
 ```
