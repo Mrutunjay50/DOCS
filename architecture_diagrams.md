@@ -1,6 +1,6 @@
 # SlashifyTech — Architecture in Diagrams
 
-Visual companion to [ARCHITECTURE.md](ARCHITECTURE.md). Every diagram is **Mermaid** — it renders in VS Code's Markdown preview (with the Mermaid extension) and on GitHub. Read top to bottom: from the 10,000-ft system map down to sequences, data, and the build timeline.
+Visual companion to [ARCHITECTURE.md](ARCHITECTURE.md). Every diagram is **Mermaid** — it renders in VS Code's Markdown preview (with the Mermaid extension) and on GitHub. Read top to bottom: from the 10,000-ft system map down to sequences, data, deployment, and the queue.
 
 > Backend: **Node 20 + Express** gateway · **Django 5 + DRF + Celery** processing engine.
 > Queue: **RabbitMQ** is the single job broker — every async task runs through it, both Node tools (merge, compress, edit, convert) and Django/Celery (OCR, translate, image→PDF). Redis is used only for cache/sessions/rate-limits.
@@ -224,55 +224,7 @@ sequenceDiagram
 
 ---
 
-## 5. Trust boundaries — what each token can do
-
-No separate private subnet — Django and the data stores live in the same network but are reachable **only** via security-group rules that name the `api-node` security group as the sole source.
-
-```mermaid
-flowchart TB
-    subgraph z1["🌐 PUBLIC ZONE"]
-        c1[web-b2c]
-        c2[web-admin]
-    end
-    subgraph z2["🚪 GATEWAY — ALB-fronted"]
-        g1[api-node<br/>Express]
-    end
-    subgraph z3["🔒 SG-RESTRICTED — not on the ALB"]
-        p1[api-django]
-        p2[celery-workers]
-        p3[workers-node]
-        db1[(node-db SoR)]
-        db2[(django-db)]
-        rd[(Redis)]
-    end
-
-    c1 -- "user JWT<br/>aud: user" --> g1
-    c2 -- "admin JWT<br/>aud: admin + TOTP + IP-allow" --> g1
-    g1 -- "HMAC + short-TTL<br/>+ X-User-Id/Tier · SG-allowed" --> p1
-    g1 --> db1
-    g1 --> rd
-    p1 --> db2
-    p2 --> db2
-    p1 --> rd
-    p2 --> rd
-    p3 --> rd
-
-    note1["❌ user token never valid on /admin/*<br/>❌ admin token never valid on B2C<br/>❌ only api-node's SG can reach Django + data stores<br/>✅ ownership check on every resource (no IDOR)"]
-    g1 -.- note1
-
-    classDef pub fill:#FEF3C7,stroke:#D97706,color:#78350F;
-    classDef gate fill:#4F46E5,stroke:#312E81,color:#fff;
-    classDef priv fill:#E0E7FF,stroke:#4338CA,color:#312E81;
-    classDef warn fill:#FEE2E2,stroke:#DC2626,color:#7F1D1D;
-    class c1,c2 pub;
-    class g1 gate;
-    class p1,p2,p3,db1,db2,rd priv;
-    class note1 warn;
-```
-
----
-
-## 6. Data model — the two databases
+## 5. Data model — the two databases
 
 ```mermaid
 erDiagram
@@ -342,9 +294,9 @@ erDiagram
 
 ---
 
-## 7. AWS deployment topology
+## 6. AWS deployment topology
 
-No dedicated private subnet tier — every service runs in the same subnets behind the VPC, and **security groups** enforce that only `api-node` reaches Django and the data stores. Only the public-facing services are attached to the ALB.
+Compute runs on **EC2** (Auto Scaling Groups, one per service role). No dedicated private subnet tier — every instance runs in the same subnets behind the VPC, and **security groups** enforce that only `api-node` reaches Django and the data stores. Only the public-facing instances are attached to the ALB.
 
 ```mermaid
 flowchart TB
@@ -352,15 +304,15 @@ flowchart TB
     CF --> ALB[Application Load Balancer<br/>ACM TLS · WAF]
 
     subgraph VPC["VPC · ≥2 AZs"]
-        subgraph EDGE["🟢 ALB-fronted services"]
-            ALB --> f1[ECS: web-b2c]
-            ALB --> f2[ECS: web-admin]
-            ALB --> f3[ECS: api-node · Express]
+        subgraph EDGE["🟢 ALB-fronted EC2 (ASG)"]
+            ALB --> f1[EC2: web-b2c]
+            ALB --> f2[EC2: web-admin]
+            ALB --> f3[EC2: api-node · Express]
         end
-        subgraph INT["🔒 SG-restricted services (not on ALB)"]
-            f3 --> w1[ECS: workers-node<br/>RabbitMQ consumers]
-            f3 --> w2[ECS: api-django]
-            w2 --> w3[ECS: celery-workers<br/>heavy image]
+        subgraph INT["🔒 SG-restricted EC2 (ASG, not on ALB)"]
+            f3 --> w1[EC2: workers-node<br/>RabbitMQ consumers]
+            f3 --> w2[EC2: api-django]
+            w2 --> w3[EC2: celery-workers<br/>heavy image]
         end
         subgraph DATA["💾 DATA layer (SG-restricted)"]
             rds1[(RDS: node-db · encrypted)]
@@ -392,7 +344,7 @@ flowchart TB
 
 ---
 
-## 8. One queue for everything — RabbitMQ
+## 7. One queue for everything — RabbitMQ
 
 Every async task goes through **RabbitMQ**. The gateway publishes a job; the right worker pool consumes it. Node tools and Django/Celery share the same broker — nothing heavy runs inline in a request.
 
