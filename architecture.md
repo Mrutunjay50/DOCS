@@ -1,223 +1,343 @@
-# System Architecture — SlashifyTech
+# SOP — Node Developer (A–Z)
+## Document Translation & PDF Utility Portal — SlashifyTech
 
-## Document Translation & PDF Utility Portal
+This is the working manual for the **Node.js / Express gateway** developer. It covers everything from environment setup to the day-to-day rules, the build order, and the definition of done. Read it once end-to-end, then use it as a reference.
 
-A consolidated architecture derived from the Product, Frontend, Backend, and Infrastructure plans. This document is the single technical reference for how the system is structured, how data and trust flow through it, and where every responsibility lives.
+> **Your one-line mandate:** Node is the **system of record** and the **only public API**. Every browser request is authenticated, metered, and (if heavy) queued by you, then proxied to Django over a signed private channel. You own identity, accounts, teams, money, history, notifications, support, the PDF tools, and the entire admin backend.
 
 ---
 
-## 1. Architectural overview
+## A. Scope & responsibilities
 
-SlashifyTech is a **polyglot, three-tier system** built India-first but global-ready (language pairs and currency are configuration, not code). The defining principles:
+**You own:**
+- Auth & sessions, accounts & settings, teams/orgs, billing, orchestration, notifications, support.
+- The PDF utility tools (merge, compress, edit, DOC↔PDF) — run as **queued RabbitMQ jobs**, never inline.
+- The entire admin backend under `/admin/*`.
+- The **Django bridge** (`ProcessingClient`) — the only code in the system allowed to call Django.
 
-| Principle | What it means |
+**You do NOT own:**
+- OCR / translation / image→PDF internals → that's the Django dev. You call them through the bridge.
+- Frontend rendering → FE dev. You serve them a clean, typed contract.
+- Infra/Terraform/EC2/RabbitMQ provisioning → DevOps. You consume what they stand up.
+
+**Hard rules (never violate):**
+1. The browser never reaches Django — only your gateway does, via the signed bridge.
+2. Heavy work is **always** queued (RabbitMQ). Request handlers stay fast.
+3. Every resource access is **ownership-checked** (no IDOR).
+4. The **OpenAPI contract is the source of truth** — keep it current or the FE/types desync.
+5. The admin module has **no document-content download route** (metadata only).
+
+---
+
+## B. Prerequisites & local environment
+
+Install:
+- **Node 20 LTS** (use `nvm`/`fnm`; pin via `.nvmrc`).
+- **pnpm** (the monorepo uses pnpm + Turborepo).
+- **Docker Desktop** (for the local stack).
+- **PostgreSQL client** (`psql`) for inspection.
+
+Local stack via `docker-compose` (owned by DevOps, you run it):
+```bash
+docker compose up -d        # Postgres ×2, Redis, RabbitMQ, MinIO (S3 stand-in)
+```
+This gives you: `node-db` + `django-db` (Postgres 16), Redis (cache/sessions/rate-limits), **RabbitMQ** (job broker, management UI on :15672), and **MinIO** as the S3 stand-in with server-side encryption.
+
+`.env` (never commit; copy from `.env.example`):
+```
+DATABASE_URL=postgresql://...node-db
+JWT_ACCESS_SECRET=...           JWT_REFRESH_SECRET=...
+RABBITMQ_URL=amqp://...         REDIS_URL=redis://...
+S3_ENDPOINT=http://localhost:9000  S3_BUCKET_UPLOADS=...  S3_BUCKET_RESULTS=...
+DJANGO_BASE_URL=http://localhost:8000
+SERVICE_BRIDGE_HMAC_SECRET=...  # shared with Django
+RAZORPAY_KEY_ID=...  RAZORPAY_KEY_SECRET=...
+```
+Secrets in real environments come from **AWS Secrets Manager / SSM**, never `.env` files in the repo.
+
+---
+
+## C. Monorepo layout (what you touch)
+
+```
+apps/
+  api-node/          ← YOUR app (Express gateway)
+  workers-node/      ← YOUR worker process (RabbitMQ consumers: PDF tools, email, exports)
+  web-b2c/ web-admin/ ← FE dev
+packages/
+  types/             ← OpenAPI-generated TS types (shared; you generate the schema)
+  api-client/        ← FE dev consumes; generated from your OpenAPI
+api-django/          ← Django dev
+```
+
+**Inside `apps/api-node/` (layered):**
+```
+src/
+  modules/
+    auth/  account/  teams/  billing/  orchestration/  support/  notifications/
+    admin/        ← separate router tree, hardened
+  middleware/     ← auth, tier-policy, rate-limit, error-envelope, request-id
+  lib/
+    processing-client.ts   ← the Django bridge (HMAC)
+    s3.ts                  ← upload/download, SSE-S3
+    queue.ts               ← RabbitMQ publisher (amqplib)
+    prisma.ts              ← Prisma client singleton
+  config/         ← env validation (zod), constants
+  openapi/        ← spec assembly + generation
+  app.ts  server.ts
+prisma/
+  schema.prisma   migrations/
+```
+Each module is a folder: `*.router.ts` → `*.controller.ts` → `*.service.ts` → Prisma. Routers wire middleware; controllers validate (zod) + shape responses; services hold logic; only services touch Prisma.
+
+---
+
+## D. Tech stack & non-negotiable conventions
+
+| Concern | Choice |
 |---|---|
-| **Single public surface** | The browser only ever talks to the Node gateway. Django is reachable only from the gateway (security-group rule), never publicly. |
-| **Async-by-default processing** | Heavy work (OCR, translation, PDF ops) runs on background workers; the UI uploads, gets a `job_id`, polls, downloads. |
-| **Encryption at rest + transit** | Files are encrypted at rest by S3 SSE-S3 (AES-256) and travel over TLS. Admins are restricted to metadata by application + JWT-scope policy (no content download route). |
-| **Contract-first coordination** | The OpenAPI schema is the source of truth across four developers — generated types keep frontend, gateway, and Django in sync. |
-| **One job broker** | RabbitMQ is the single queue for all async work — Node tools (merge, compress, edit, convert) and Django/Celery (OCR, translate, image→PDF). Redis is only cache/sessions/rate-limits. |
-| **Infrastructure as code** | Everything is Terraform; no click-ops in production. |
+| Runtime / framework | Node 20 + **Express 4** + TypeScript (strict) |
+| ORM | **Prisma** + PostgreSQL 16 |
+| Validation | **zod** on every request body/query/params; env validated at boot |
+| Auth | **JWT** access (~15 min) + rotating refresh (hashed in `Session`); argon2id for passwords; admin = `aud: admin` + TOTP |
+| Job broker | **RabbitMQ** (amqplib) — all async work; one broker system-wide |
+| Cache/sessions/rate-limit | **Redis 7** only (not a job broker) |
+| Object storage | **S3** with **SSE-S3** (AES-256); presigned URLs for download; no KMS |
+| Payments | Razorpay behind a `PaymentProvider` interface (Stripe-swappable) |
+| Contract | **drf-spectacular/OpenAPI** → generated Node client + FE types |
+| Lint/format | ESLint + Prettier (CI-enforced) |
+| Tests | Jest (unit/integration), Testcontainers (real Postgres+Redis), nock/msw (bridge contract) |
+
+**Response envelope (uniform, always):**
+```ts
+{ data }                      // success (single)
+{ data, page }                // success (paginated, cursor-based)
+{ error: { code, message } }  // failure — never leak stack traces
+```
+Error codes are a shared enum (e.g. `quota_exceeded`, `file_too_large`, `engine_not_in_tier`, `unauthorized`, `forbidden`, `not_found`, `rate_limited`). FE maps these to copy — coordinate names via the contract.
 
 ---
 
-## 2. Three-tier topology
+## E. Foundations — build these FIRST (block everything)
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│ TIER 1 · CLIENTS  (Next.js App Router · TypeScript)                   │
-│                                                                       │
-│   web-b2c  ─────────────┐         web-admin ────────────┐             │
-│   consumer app          │         staff dashboard       │             │
-│   (mobile-first)        │         (desktop-first)       │             │
-│                         └──────────────┬────────────────┘             │
-│              access token (user)  │  admin token (aud: admin, TOTP)   │
-└────────────────────────────────────┼──────────────────────────────────┘
-                                      │  HTTPS — calls ONLY the Node API
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ TIER 2 · GATEWAY  (Node 20 · Express · Prisma)                        │
-│                                                                       │
-│   Auth · Accounts · Teams · Billing · PDF tools · Orchestration       │
-│   · Notifications · Support · ENTIRE admin backend                    │
-│                                                                       │
-│   System of record: PostgreSQL 16 (shared w/ admin, elevated creds)   │
-│   Async jobs: RabbitMQ (Node consumers)  ·  Cache/sessions: Redis 7   │
-└────────────────────────────────────┬──────────────────────────────────┘
-                                      │  signed service token
-                                      │  (HMAC + short-TTL + X-User-Id/Tier)
-                                      ▼   — the ONLY caller of Django
-┌─────────────────────────────────────────────────────────────────────┐
-│ TIER 3 · PROCESSING  (Django 5 · DRF · Celery)                        │
-│                                                                       │
-│   OCR · Translation (Hi↔En) · Image→PDF · heavy document work         │
-│   Stateless about users; trusts Node's signed token.                  │
-│                                                                       │
-│   Processing DB: PostgreSQL 16   ·   Broker: RabbitMQ (Celery)        │
-│   Storage: S3 (SSE-S3, AES-256 at rest) — reached over TLS            │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Build in this order before any feature module:
 
-### Ownership boundaries
+1. **Config + env validation** (`config/`) — zod-parse all env at boot; fail fast.
+2. **Prisma client singleton** (`lib/prisma.ts`) + initial schema + first migration.
+3. **Error-envelope middleware** — central error handler; maps thrown `AppError(code, message, status)` to the envelope; scrubs secrets.
+4. **Request context + auth middleware** — validate access JWT, load `req.user` + active subscription + **org context** (`req.org`, `req.tier`). Public routes explicitly allow-listed. Admin routes require `aud: admin`.
+5. **Tier policy** — entitlements from the `Plan` table; helper `assertEntitlement(tier, key)`; Django re-checks too (defence in depth).
+6. **Rate limiting** — Redis token-bucket per user & per IP; tighter on `/auth/*` and `/billing/*`.
+7. **S3 layer** (`lib/s3.ts`) — `putObject` (SSE-S3), `getSignedDownloadUrl` (short TTL).
+8. **RabbitMQ** (`lib/queue.ts`) — connection, `publish(queue, payload)`, durable queues, dead-letter queue for poison messages.
+9. **The Django bridge** (`lib/processing-client.ts`) — see section F.
+10. **OpenAPI assembly + generation** wired into the build (see section L).
 
-- **Node owns** identity, accounts, teams, money, history, notifications, support, the PDF utility tools (run on its own RabbitMQ worker pool), and the entire admin backend. It is the only thing that calls Django.
-- **Django owns** CPU/memory-heavy document processing: OCR, translation, image→PDF — every heavy task on Celery workers, never inline.
-- **Two databases:** Node's system-of-record Postgres (shared with admin) and Django's processing Postgres. A Node `JobRef` mirrors the Django `Job` so history/status render without re-querying Django.
+Only after these compile and have tests do you start feature modules.
 
 ---
 
-## 3. Document privacy & lifecycle
+## F. The Django bridge (`ProcessingClient`) — critical
 
-Files are encrypted at rest and in transit, kept private from the admin plane by application policy, and deleted at 24h.
+Every call to Django goes through this one class. Nothing else in Node may import the Django URL.
 
-```
-UPLOAD   client → Node (TLS) → validate JWT + tier → store object in S3
-         (SSE-S3, AES-256 at rest) → store metadata + SHA-256 on Job/JobRef
-
-PROCESS  Django worker fetches the object → OCR/translation in memory →
-         stores the result in S3 → discards working copy
-
-ADMIN    admin plane has NO content-download route → metadata + SHA-256 only
-
-DELETE   at expires_at (24h): S3 lifecycle rule + Celery-beat sweep delete
-         the object and mark the record removed
-```
-
-**Privacy controls:**
-
-| Concern | Mechanism |
-|---|---|
-| At rest | S3 SSE-S3 (AES-256, S3-managed keys); RDS + ElastiCache encryption on |
-| In transit | TLS everywhere — ACM on the ALB, internal TLS to Django |
-| Admin content lockout | application + JWT-scope policy: the admin module exposes no file-download path; it reads metadata only |
-| Retention | 24h S3 lifecycle + Celery-beat sweep |
-
-> **Note on the privacy guarantee.** This is application-enforced, not crypto-enforced. Without KMS envelope encryption + an IAM decrypt split, "admins cannot read documents" holds by policy (no download route, least-privilege IAM on the bucket) rather than by cryptography. If a stronger, provable guarantee is needed later, reintroducing KMS envelope encryption is the upgrade path.
+- **Signing:** HMAC the request body with `SERVICE_BRIDGE_HMAC_SECRET` + a short-TTL timestamp; send as a header. Django's custom DRF auth class rejects anything unsigned or stale.
+- **Headers:** attach `X-User-Id` and `X-User-Tier` so Django can re-check tier.
+- **Resilience:** sane timeouts, bounded retries (idempotent calls only), circuit-break on repeated failure. On Django downtime, surface a clean `503 engine_unavailable` — never hang the request.
+- **Surface:** `submitOcr`, `submitTranslate`, `detectLanguage`, `submitImagesToPdf`, `getJob`, `getJobResult`, `takedown(jobId)`.
+- **Contract test it** with nock/msw: signing header present + correct, user headers attached, error mapping (Django `4xx/5xx` → your error codes).
 
 ---
 
-## 4. Component breakdown
+## G. Orchestration & the job lifecycle (the heart of the gateway)
 
-### Tier 1 — Frontend (monorepo: pnpm + Turborepo)
-
-| Package | Role |
-|---|---|
-| `apps/web-b2c` | Consumer app — landing, tools, translate, camera scan, PDF editor, dashboard, history, billing, teams, auth. Mobile-first. |
-| `apps/web-admin` | Staff dashboard on a shadcn admin template + Tremor charts — users, payments, documents, support, plans, analytics. Desktop-first. |
-| `packages/ui` | shadcn/ui component library + design tokens (indigo/violet) shared by both apps. |
-| `packages/types` | TypeScript types generated from the gateway's OpenAPI schema. |
-| `packages/api-client` | Thin typed fetch client: auth attach, 401→refresh→retry, error-envelope handling — the only thing that touches the network. |
-
-**Frontend foundations (built first):** typed API client, auth/session (access token in memory, refresh in httpOnly cookie), `useJob(jobId)` polling hook (SSE-swappable), reusable uploader, error/toast layer mapping gateway codes (`quota_exceeded`, `file_too_large`, `engine_not_in_tier`) to friendly upsell copy. Data layer is TanStack Query; forms are react-hook-form + zod; i18n in Hindi + English from day one.
-
-### Tier 2 — Node gateway (Express)
-
-Built on **Express 4** with a layered structure (routers → controllers → services → Prisma repositories) and middleware for the cross-cutting concerns. Foundations first: the `ProcessingClient` Django bridge (HMAC signing), an S3 upload layer (objects stored with SSE-S3), a JWT auth middleware that populates org context (`req.user`/`req.tier`/`req.org`), tier policy + config-driven language/currency tables, Redis rate limiting, uniform response/error-envelope middleware, and a RabbitMQ publisher + worker pool (amqplib). Validation via zod; routes grouped into feature modules (folders) so the `/admin/*` tree stays isolated from the public API.
-
-| Module | Responsibility |
-|---|---|
-| 01 Auth & sessions | argon2id, JWT access (~15m) + rotating refresh, Google OAuth, email verification, password reset, device/session management (Redis denylist) |
-| 02 Account & settings | profile/avatar, email-change re-verify, password change, delete (soft-delete + purge + Django file delete), async data export |
-| 03 Teams | `Organization` / `Membership` (owner/admin/member) / `Invite`; pooled org quota; org context in JWT |
-| 04 Subscriptions & billing | versioned `Plan` with rich entitlements; Razorpay behind a `PaymentProvider` interface; idempotent verification; GST invoices |
-| 05 Orchestration & activity | job proxy → store in S3 → Django → `JobRef`; history (cursor paginated); notifications; support intake |
-| 06 PDF tools (RabbitMQ workers) | merge (pdf-lib/qpdf), compress (Ghostscript), edit (pdf-lib), DOC→PDF (LibreOffice), PDF→DOC (Django OCR fallback for scans) — all run as queued jobs, never inline |
-| 07–10 Admin backend | separate module tree under `/admin/*`: AdminUser + TOTP + IP allowlist; user directory & 360 + impersonation; document oversight + flagging + takedown bridge; read-only billing ops; versioned plan editor; support desk; alert inbox; analytics |
-
-### Tier 3 — Django processing engine (DRF + Celery)
-
-Foundations: shared `Job` model, magic-byte file validation, S3 object fetch (decrypted transparently by SSE-S3), untrusted binaries (LibreOffice/Ghostscript/Tesseract) sandboxed non-root with timeouts, Celery-beat GC past `expires_at`.
-
-| Module | Responsibility |
-|---|---|
-| 01 OCR / text extraction | Tesseract 5 (`hin`/`eng`) + pre-processing pipeline (grayscale→deskew→denoise→threshold→upscale); premium Google Vision/Textract behind an `OCREngine` adapter; camera perspective-correction |
-| 02 Translation | `TranslationEngine` adapter (LibreTranslate free / Google·DeepL premium); chunked long docs; **Devanagari export with Noto Sans embedded** (TXT/DOCX/PDF); sync language auto-detect |
-| 03 Image→PDF | `img2pdf` lossless (Pillow fallback); each image → centred A4 page, EXIF honoured |
-
-Adapters mean premium engines are **config, not new endpoints** — adding them never touches the processing path.
-
----
-
-## 5. Data model (consolidated)
-
-**Node / shared system-of-record DB:**
-`User` · `OAuthAccount` · `Session` · `VerificationToken` · `Organization` · `Membership` · `Invite` · `Plan` (versioned, rich entitlements, currency) · `Subscription` (user- or org-scoped) · `Invoice` (GST fields) · `JobRef` (tool, fileName, size, **sha256**, status) · `Notification` · `SupportTicket` · `DataExportRequest` · `AdminUser` · `AdminAlert` · `ReportJob`
-
-**Django processing DB:**
-`Job` (UUID, user_id, tier, tool, status, result_file, meta, **sha256**, s3_key, expires_at) · `UploadedFile` · `OCRResult` · `TranslationResult` · `UsageEvent` (billing reconciliation back to Node) · `Language` (config)
-
----
-
-## 6. Key request flow — a translation job
+The canonical flow for any processing job:
 
 ```
-1. web-b2c: user picks source/target lang (config from gateway), uploads file
-2. Node: auth middleware validates JWT → tier policy checks entitlements
-3. Node: store object in S3 (SSE-S3, encrypted at rest)
-4. Node: ProcessingClient (HMAC-signed) → POST Django /api/v1/translate/
-         with X-User-Id, X-User-Tier; stores a JobRef (status=queued)
-5. Django: service-token auth → enqueues Celery task → returns job id
-6. Celery worker: fetch object from S3 → process in memory → OCR if needed
-                  → translate → Devanagari-correct export → store result in S3
-7. web-b2c: useJob() polls Node GET /api/jobs/{id}; Django completion
-            refreshes the cached JobRef status
-8. Download: Node proxies a short-lived signed S3 URL — client never reaches Django
-9. At 24h: Celery-beat + S3 lifecycle delete the object
+POST /api/tools/{slug}
+  → auth middleware (req.user, req.tier)
+  → zod-validate body + file (type by magic bytes, size by tier)
+  → tier policy: assertEntitlement
+  → s3.putObject(upload)                       # SSE-S3
+  → ProcessingClient.submitX(...)              # signed bridge → Django enqueues Celery
+  → persist JobRef { djangoJobId, tool, fileName, size, sha256, status: queued, ownerId }
+  → respond { data: { jobId } }                # fast; no waiting
+```
+
+- **Polling:** `GET /api/jobs/{id}` returns cached `JobRef` status (ownership-checked). Django's completion webhook refreshes the cached status. Designed so an SSE upgrade is a drop-in later.
+- **Download:** `GET /api/jobs/{id}/download` → mint a **short-lived signed S3 URL** and 302. The client never reaches Django.
+- **History:** cursor pagination; filter (tool/status/date); search; Today/This-week/Earlier buckets; bulk delete (records + tell Django to delete files).
+
+---
+
+## H. PDF tools as queued jobs (Node workers)
+
+All PDF tools run in `apps/workers-node` as **RabbitMQ consumers**, never inline:
+
+```
+POST /api/pdf/merge  → validate + tier check → s3.putObject(inputs)
+  → publish("pdf.merge", { jobId, s3Keys, options, ownerId })
+  → persist JobRef (status: queued) → respond { jobId }
+
+worker-node consumes "pdf.merge"
+  → fetch inputs from S3 → run tool (pdf-lib / Ghoststript / qpdf / LibreOffice)
+  → store result in S3 → update JobRef (status: done) → notify
+```
+
+Tool notes:
+- **Merge** — pdf-lib; client-supplied order; encrypted-input support via qpdf; enforce tier batch/size limits.
+- **Compress** — Ghostscript subprocess; presets + target-MB mode; hard timeout; non-root, temp dir.
+- **Edit** — apply a normalised operations list with pdf-lib (coords in PDF points).
+- **DOC→PDF** — LibreOffice headless; Noto Sans Devanagari in the worker image; dedicated **low-concurrency** queue.
+- **PDF→DOC** — LibreOffice for text PDFs; **scanned/no-text-layer PDFs proxy to Django OCR first** (the one PDF tool that calls the bridge).
+
+Always: sandbox untrusted binaries, non-root user, temp working dir, hard timeouts, memory caps.
+
+---
+
+## I. Module build order (matches the program plan)
+
+Build features in this dependency order; each unlocks the next:
+
+1. **Auth & sessions** — signup/login (argon2id), JWT access + rotating refresh (hashed in `Session`), Google OAuth + account linking, email verification gate, password reset (single-use, time-boxed, hashed tokens; no enumeration; reset revokes all sessions), session/device management (revoke via Redis denylist).
+2. **Orchestration + history + notifications** — section G. Free-tier core works end to end after this.
+3. **PDF tools** — section H.
+4. **Account & settings** — profile/avatar (presigned upload + sharp resize), email-change re-verify, password change (revokes other sessions), delete account (re-auth + type-to-confirm; cancels sub; soft-delete + delayed purge that also tells Django to delete files; invoices retained anonymised), data export (async RabbitMQ job → zip → S3 signed link).
+5. **Billing** — `Plan` (versioned, rich entitlements, currency), Razorpay behind `PaymentProvider`, **server-side idempotent payment verification before activating**, cancel-at-period-end, dunning, GST invoices (`gstin, placeOfSupply, cgst, sgst, igst, hsnSac, taxableValue, total`) rendered server-side.
+6. **Teams** — `Organization`/`Membership`(owner|admin|member)/`Invite`; seat limits; **pooled quota** (usage counted at org level); org context in JWT; role guard on org routes.
+7. **Admin backend** (`/admin/*`) — separate router tree, hardened (see section J).
+
+---
+
+## J. Admin backend rules (`/admin/*`)
+
+A separate, hardened router tree sharing the DB with elevated credentials.
+
+- **Identity:** `AdminUser` (separate from `User`), argon2id, **mandatory TOTP 2FA**, `aud: admin` short token + rotating refresh, **IP allowlist**, lockout. A user token can never reach `/admin/*` and vice versa.
+- **People & docs:** cursor-paginated user directory (filters, quota/spend read models, CSV export); user-360 aggregation; **time-boxed flagged impersonation** (`scope: support`, logged on mint + per action); suspend/reinstate (status + session revoke + job block + notify); **document oversight** = JobRef metadata + SHA-256 + Flagged status; **takedown** purges the file via the bridge — **content never enters the admin backend**.
+- **Billing ops (read-only):** ledger + revenue tiles, subscription oversight reconciled vs provider, invoice/revenue reports as async `ReportJob`s.
+- **Platform ops:** versioned plan/entitlement editor (the exact numbers Django enforces — no drift); support desk; alert inbox (`AdminAlert`); analytics (cached aggregates + live queue depth).
+
+**Audit everything:** every admin action, impersonation mint/use, and takedown is logged immutably.
+
+---
+
+## K. Database & Prisma workflow
+
+- Schema lives in `prisma/schema.prisma`. Core models: `User, OAuthAccount, Session, VerificationToken, Organization, Membership, Invite, Plan, Subscription, Invoice, JobRef, Notification, SupportTicket, DataExportRequest, AdminUser, AdminAlert, ReportJob`.
+- **Migrations:** `pnpm prisma migrate dev` locally; never edit a shipped migration. In staging/prod, migrations run as **one-off SSM jobs** (DevOps) using **expand-then-contract** for zero downtime.
+- Use transactions for multi-write invariants (e.g. accept-invite + decrement seat).
+- Index what you filter/paginate on (cursor fields, `ownerId`, `status`, `createdAt`).
+- `JobRef.djangoJobId` mirrors the Django `Job` — that's a logical link across two DBs, not an FK.
+
+---
+
+## L. The OpenAPI contract (your coordination tool)
+
+There is no PM — the contract keeps four developers in sync.
+
+- Define/annotate every endpoint's request + response schema as you build it.
+- On every gateway change: **regenerate** `packages/types` and the FE `api-client`. CI has an **OpenAPI gate** that fails the build if the contract and consumers drift.
+- Treat a contract change like an API change: communicate it, version if breaking.
+
+---
+
+## M. Security checklist (apply to every endpoint)
+
+- [ ] **Ownership check** on every resource (no IDOR) — filter by `req.user.id`/`req.org.id`, never trust a path id alone.
+- [ ] **zod validation** on body, query, params; reject unknown fields.
+- [ ] **Tier policy** enforced before doing work; Django re-checks.
+- [ ] **Rate limit** appropriate to the route (tighter on auth/payments/public forms; captcha on public support form).
+- [ ] **No account enumeration** (login, forgot-password, signup return uniform responses/timing).
+- [ ] **Idempotent payment verification** (idempotency key; verify server-side before activating).
+- [ ] **Secrets scrubbed** from logs; never log tokens, card data, file contents.
+- [ ] **Admin routes**: `aud: admin`, TOTP, IP allowlist, no decrypt/download path.
+- [ ] File uploads: validate **magic bytes** + size **by tier** before storing.
+
+---
+
+## N. Testing standards
+
+Weight testing on **auth, money, the staff boundary, and document safety**.
+
+- **Unit:** services + guards + pure helpers.
+- **Integration:** endpoints against real test Postgres + Redis via **Testcontainers**.
+- **Bridge contract:** nock/msw — signing, headers, error mapping.
+- **Always test:** idempotent payment verification; no-IDOR on every resource; no account enumeration; that the admin module exposes **no document-content download route**; pooled-quota decrements across org members; seat limits on invite/accept.
+- Mock all paid providers (Razorpay/Google/DeepL) in CI; keep one gated live test each.
+- Target: ~20% of every feature's effort is your own tests (no dedicated QA). You also write Playwright flows for your surface (DevOps maintains the harness).
+
+---
+
+## O. Git & PR workflow
+
+- Branch per task: `feat/auth-refresh-rotation`, `fix/billing-idempotency`.
+- Conventional commits; small, reviewable PRs.
+- PR must: pass lint + typecheck + tests + the OpenAPI gate; include tests; update the contract; note any migration.
+- Never commit secrets or `.env`. Never skip CI hooks.
+- Migrations: expand-then-contract; never destructive without a backfill plan.
+
+---
+
+## P. Observability & ops hooks
+
+- **Structured JSON logs** with a request id; secrets scrubbed.
+- **Sentry** wired in `api-node` and `workers-node`.
+- Emit metrics for: request latency, error rates, **queue depth**, worker throughput, payment success/failure.
+- Watch the **RabbitMQ Management UI** (queue backlog, dead-letter queue) and **Flower** (Celery) when debugging cross-service jobs.
+
+---
+
+## Q. Definition of Done (per feature)
+
+A feature is done when:
+1. Endpoints implemented with zod validation + the uniform envelope.
+2. Ownership + tier + rate-limit checks in place.
+3. Heavy work is queued (not inline); workers idempotent + bounded.
+4. Prisma migration written (expand-then-contract) and applied.
+5. OpenAPI updated; `types` + `api-client` regenerated; gate green.
+6. Unit + integration tests pass; security checklist (section M) walked.
+7. Logs/metrics emitted; errors mapped to known codes.
+8. PR reviewed and merged; contract change communicated to FE/Django.
+
+---
+
+## R. Quick reference — endpoints you own
+
+```
+# Public (access token required except auth)
+POST /auth/signup /login /refresh /logout /google
+POST /auth/verify-email /forgot-password /reset-password
+GET  /auth/sessions          DELETE /auth/sessions/{id}
+GET  /account   PATCH /account /account/email /account/password
+DELETE /account              POST /account/export   GET /account/export
+POST /orgs   GET /orgs/{id}   POST /orgs/{id}/invites
+POST /orgs/invites/{token}/accept
+PATCH/DELETE /orgs/{id}/members/{userId}
+GET  /billing/plans /billing/summary /billing/invoices
+POST /billing/checkout       POST /billing/subscription/cancel
+POST /api/tools/{slug}       GET /api/jobs/{id} /api/jobs/{id}/download
+GET  /history                POST /history/bulk-delete
+GET  /notifications          POST /notifications/read
+POST /support/tickets
+POST /api/pdf/merge /compress /edit
+POST /api/convert/doc-to-pdf /pdf-to-doc
+
+# Admin (aud: admin, 2FA, IP-allowlisted)
+POST /admin/auth/login /2fa /refresh /logout
+GET  /admin/users /admin/users/export
+GET/POST /admin/users/{id} /{id}/impersonate
+POST /admin/users/{id}/suspend /reinstate
+GET/POST /admin/documents /{id}/takedown
+GET  /admin/payments /{id} /metrics/revenue
+GET  /admin/subscriptions
+GET/POST /admin/invoices /reports/revenue /reports/export
+GET/PATCH/POST /admin/plans /{id} /{id}/publish
+GET/POST/PATCH /admin/tickets /{id} /{id}/reply
+GET/POST /admin/alerts /alerts/read
+GET  /admin/dashboard /metrics/{series}
 ```
 
 ---
 
-## 7. Infrastructure (AWS, Terraform)
-
-```
-Internet → CloudFront (CDN, signed downloads) → ALB (ACM TLS, WAF)
-   │
-   ├─ ALB-fronted   · EC2 (ASG): web-b2c, web-admin, api-node
-   │
-   └─ SG-restricted · EC2 (ASG): workers-node, api-django, celery-workers
-        (not attached to the ALB — reachable only from api-node's SG)
-                            │
-        RDS PostgreSQL 16 (node-db SoR + django-db, separate; encrypted)
-        Amazon MQ for RabbitMQ (single job broker: Node + Celery)
-        ElastiCache Redis (cache, sessions, rate limits; encrypted)
-        S3 (uploads/results/exports, SSE-S3, 24h lifecycle)
-```
-
-- **Compute:** EC2 Auto Scaling Groups, one per service role (Docker images pulled from ECR, run via the ECS agent in EC2 mode or a systemd/compose unit). No separate private subnet tier — security groups enforce that only `api-node` can reach Django and the data stores, and only public-facing instances are attached to the ALB.
-- **Container images:** slim non-root Node/Python bases. The heavy `celery-workers` image bundles tesseract-ocr-hin, poppler, ghostscript, libreoffice, qpdf, **Noto Sans Devanagari**; `workers-node` carries ghostscript/qpdf/libreoffice for Node-side PDF tools.
-- **CI/CD:** GitHub Actions, path-filtered per-service pipelines (lint→typecheck→test→build→ECR→staging→smoke→gate→prod). Prisma + Django migrations run as one-off jobs (SSM run-command on a deploy instance) with expand-then-contract. An OpenAPI gate fails the build on contract drift.
-- **Observability:** Sentry everywhere; Grafana/Datadog metrics & logs (secrets scrubbed); Flower (Celery) + the RabbitMQ Management UI for live queue/job visibility; immutable audit log for every admin action, impersonation, and takedown.
-- **Scaling:** stateless services autoscale on CPU/request; **workers autoscale on queue depth** with priority queues by tier (premium vs free) and heavy LibreOffice/Ghostscript queues capped at low concurrency.
-- **DR:** RDS PITR + restore drills; exports bucket versioned; uploads/results intentionally ephemeral (not backed up, by design). Multi-AZ across ≥2 AZs.
-
----
-
-## 8. Trust & security model
-
-| Boundary | Control |
-|---|---|
-| Browser → Node | access JWT (user) or admin token (`aud: admin`, never cross-valid); TLS |
-| Node → Django | HMAC-signed body + short-TTL timestamp + user headers; DRF auth class rejects unsigned; SG rule allows only `api-node` |
-| Admin plane | separate `AdminUser`, mandatory TOTP 2FA, IP allowlist, short hardened sessions, tighter rate limits |
-| Document content | encrypted at rest (S3 SSE-S3) + TLS in transit; admin plane has no content-download route (metadata only) |
-| Every resource | ownership checks (no IDOR), no account enumeration, idempotent payment verification |
-| Compliance | DPDP-aligned: encryption at rest + transit, 24h retention + deletion, data export & deletion flows, metadata-only admin access |
-
----
-
-## 9. Build sequencing (dependency-ordered)
-
-The order is structured so the **free-tier B2C product works end to end after Step 2/3**; billing, teams, premium engines, and admin layer on top without touching the processing path — only plan entitlements change.
-
-| Step | Node | Django | Frontend | DevOps |
-|---|---|---|---|---|
-| 0 Foundations | service bridge, auth middleware, Prisma, RabbitMQ pub/worker, rate limit | shared Job, Celery on RabbitMQ, service-token auth, tier policy | shared UI kit, OpenAPI client, app shells | monorepo, CI/CD, SG model, Terraform, worker images |
-| 1 Free core | auth, job proxy, history, notifications | OCR + pre-processing | B2C auth, dashboard, translate, history | Tesseract/Poppler image |
-| 2 PDF suite | merge/compress/edit/DOC↔PDF | image→PDF (then lend to Node) | tool screens, PDF.js editor, camera | Ghostscript/LibreOffice/Noto image |
-| 3 Money | plans, Razorpay, lifecycle, GST | (idle → assist Node) | pricing, checkout, billing | billing observability |
-| 4 Teams | orgs, seats, invites, pooled billing | (assist) | team settings | — |
-| 5 Premium | — | Vision/Textract + Google/DeepL adapters | (freed for admin) | — |
-| 6 Admin | auth boundary → users → docs → billing ops → analytics | absorb admin CRUD | second app on template; dashboard last | absorb admin CRUD glue |
-| 7 Hardening | — | — | Playwright E2E flows | load test, security pass, DPDP docs, autoscaling |
-
-**Capacity notes:** the single FE dev is the critical path — the two apps are deliberately sequenced so they're never built at once. Node is second-heaviest; Django's idle stretches (Steps 3–5) are explicitly lent to Node. With no PM, the OpenAPI contract is the coordination tool; with no QA, ~20% of each step is the owning dev's testing plus a DevOps-owned E2E/load harness.
+*Companion docs: [ARCHITECTURE.md](ARCHITECTURE.md) (system design), [ARCHITECTURE-DIAGRAMS.md](ARCHITECTURE-DIAGRAMS.md) (visuals), [02-Backend-Development-Plan.md](02-Backend-Development-Plan.md) (module specs).*
