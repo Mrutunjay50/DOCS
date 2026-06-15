@@ -4,7 +4,7 @@ Visual companion to [ARCHITECTURE.md](ARCHITECTURE.md). Every diagram is **Merma
 
 > Backend: **Node 20 + Express** gateway · **Django 5 + DRF + Celery** processing engine.
 > Queue: **RabbitMQ** is the single job broker — every async task runs through it, both Node tools (merge, compress, edit, convert) and Django/Celery (OCR, translate, image→PDF). Redis is used only for cache/sessions/rate-limits.
-> Security model: **JWT** auth throughout; files encrypted at rest via **S3 SSE-S3** + TLS in transit (no KMS envelope encryption). Django kept private by **security-group rules**, not a separate private subnet.
+> Security model: **JWT** auth throughout; files encrypted at rest via **S3 SSE-S3** + TLS in transit (no KMS envelope encryption). Django is an internal service — the gateway is the only thing that calls it.
 
 ---
 
@@ -21,7 +21,7 @@ flowchart TB
     end
 
     GW{{"🚪 Express Gateway<br/>api-node<br/>— the ONLY public API —"}}
-    DJ["⚙️ Django Engine<br/>OCR · Translate · Image→PDF<br/>— SG-restricted, not public —"]
+    DJ["⚙️ Django Engine<br/>OCR · Translate · Image→PDF<br/>— internal, called only by the gateway —"]
 
     EXT1["💳 Razorpay"]
     EXT2["🔤 Google Vision / Textract<br/>Google / DeepL"]
@@ -49,84 +49,7 @@ flowchart TB
 
 ---
 
-## 2. The three tiers, exploded
-
-Every module, grouped by the tier and process that owns it.
-
-```mermaid
-flowchart TB
-    subgraph T1["🖥️ TIER 1 · CLIENTS — Next.js App Router · TypeScript"]
-        direction LR
-        subgraph B2C["apps/web-b2c · mobile-first"]
-            b1[Landing / Tools]
-            b2[Translate + Camera Scan]
-            b3[PDF.js Editor]
-            b4[Dashboard / History]
-            b5[Billing / Teams / Auth]
-        end
-        subgraph ADM["apps/web-admin · desktop-first"]
-            a1[Users + 360 + Impersonate]
-            a2[Payments / Invoices]
-            a3[Document Oversight]
-            a4[Support Desk]
-            a5[Plans Editor / Analytics]
-        end
-        subgraph PKG["shared packages"]
-            p1[(ui · shadcn)]
-            p2[(types · OpenAPI-gen)]
-            p3[(api-client)]
-        end
-    end
-
-    subgraph T2["🚪 TIER 2 · GATEWAY — Node 20 · Express · Prisma"]
-        direction LR
-        subgraph PUB["public modules"]
-            m1[01 Auth & Sessions]
-            m2[02 Account]
-            m3[03 Teams]
-            m4[04 Billing + GST]
-            m5[05 Orchestration]
-            m6[06 PDF Tools · RabbitMQ]
-        end
-        subgraph ADMB["/admin/* · hardened"]
-            n1[07 AdminUser + TOTP]
-            n2[08 People & Documents]
-            n3[09 Billing Ops]
-            n4[10 Platform Ops]
-        end
-        subgraph MID["middleware spine"]
-            x1{{JWT auth + org ctx}}
-            x2{{tier policy}}
-            x3{{rate limit}}
-            x4{{error envelope}}
-        end
-    end
-
-    subgraph T3["⚙️ TIER 3 · PROCESSING — Django 5 · DRF · Celery"]
-        direction LR
-        d1[01 OCR · Tesseract<br/>+ pre-processing]
-        d2[02 Translation<br/>+ Devanagari export]
-        d3[03 Image → PDF]
-        d4{{service-token auth}}
-    end
-
-    T1 -- "api-client · JWT" --> MID
-    PUB --> m5
-    m5 -- "ProcessingClient<br/>HMAC + X-User-Tier" --> d4
-    m6 -. "scanned PDF→DOC<br/>fallback only" .-> d4
-    ADMB -- "takedown bridge" --> d4
-
-    classDef t1 fill:#EEF2FF,stroke:#4F46E5,color:#312E81;
-    classDef t2 fill:#EDE9FE,stroke:#7C3AED,color:#4C1D95;
-    classDef t3 fill:#F5F3FF,stroke:#8B5CF6,color:#4C1D95;
-    class b1,b2,b3,b4,b5,a1,a2,a3,a4,a5,p1,p2,p3 t1;
-    class m1,m2,m3,m4,m5,m6,n1,n2,n3,n4,x1,x2,x3,x4 t2;
-    class d1,d2,d3,d4 t3;
-```
-
----
-
-## 3. Document lifecycle & privacy
+## 2. Document lifecycle & privacy
 
 Files are encrypted at rest by **S3 SSE-S3** (AES-256, S3-managed) and travel over TLS. Admins are restricted to metadata by **application + JWT scope policy**. Everything is deleted at 24h.
 
@@ -177,7 +100,7 @@ flowchart LR
 
 ---
 
-## 4. Request lifecycle — a translation job, end to end
+## 3. Request lifecycle — a translation job, end to end
 
 ```mermaid
 sequenceDiagram
@@ -224,7 +147,7 @@ sequenceDiagram
 
 ---
 
-## 5. Data model — the two databases
+## 4. Data model — the two databases
 
 ```mermaid
 erDiagram
@@ -294,9 +217,9 @@ erDiagram
 
 ---
 
-## 6. AWS deployment topology
+## 5. AWS deployment topology
 
-Compute runs on **EC2** (Auto Scaling Groups, one per service role). No dedicated private subnet tier — every instance runs in the same subnets behind the VPC, and **security groups** enforce that only `api-node` reaches Django and the data stores. Only the public-facing instances are attached to the ALB.
+Compute runs on **EC2** (Auto Scaling Groups, one per service role). All instances sit in one VPC; the ALB fronts the web and API instances, and the workers + Django consume jobs from RabbitMQ.
 
 ```mermaid
 flowchart TB
@@ -304,17 +227,15 @@ flowchart TB
     CF --> ALB[Application Load Balancer<br/>ACM TLS · WAF]
 
     subgraph VPC["VPC · ≥2 AZs"]
-        subgraph EDGE["🟢 ALB-fronted EC2 (ASG)"]
+        subgraph EC2["🖥️ EC2 — Auto Scaling Groups"]
             ALB --> f1[EC2: web-b2c]
             ALB --> f2[EC2: web-admin]
             ALB --> f3[EC2: api-node · Express]
-        end
-        subgraph INT["🔒 SG-restricted EC2 (ASG, not on ALB)"]
             f3 --> w1[EC2: workers-node<br/>RabbitMQ consumers]
             f3 --> w2[EC2: api-django]
             w2 --> w3[EC2: celery-workers<br/>heavy image]
         end
-        subgraph DATA["💾 DATA layer (SG-restricted)"]
+        subgraph DATA["💾 DATA layer"]
             rds1[(RDS: node-db · encrypted)]
             rds2[(RDS: django-db · encrypted)]
             mq[(🐰 Amazon MQ · RabbitMQ<br/>single job broker)]
@@ -333,18 +254,16 @@ flowchart TB
     w3 -. "cloud OCR/translate APIs" .-> NET
 
     classDef pub fill:#DCFCE7,stroke:#16A34A,color:#14532D;
-    classDef priv fill:#E0E7FF,stroke:#4338CA,color:#312E81;
     classDef data fill:#FEF9C3,stroke:#CA8A04,color:#713F12;
     classDef edge fill:#F1F5F9,stroke:#64748B,color:#1E293B;
-    class f1,f2,f3 pub;
-    class w1,w2,w3 priv;
+    class f1,f2,f3,w1,w2,w3 pub;
     class rds1,rds2,ec,s3,mq data;
     class CF,ALB,NET edge;
 ```
 
 ---
 
-## 7. One queue for everything — RabbitMQ
+## 6. One queue for everything — RabbitMQ
 
 Every async task goes through **RabbitMQ**. The gateway publishes a job; the right worker pool consumes it. Node tools and Django/Celery share the same broker — nothing heavy runs inline in a request.
 
