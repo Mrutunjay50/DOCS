@@ -3,6 +3,7 @@
 Visual companion to [ARCHITECTURE.md](ARCHITECTURE.md). Every diagram is **Mermaid** — it renders in VS Code's Markdown preview (with the Mermaid extension) and on GitHub. Read top to bottom: from the 10,000-ft system map down to sequences, data, and the build timeline.
 
 > Backend: **Node 20 + Express** gateway · **Django 5 + DRF + Celery** processing engine.
+> Queue: **RabbitMQ** is the single job broker — every async task runs through it, both Node tools (merge, compress, edit, convert) and Django/Celery (OCR, translate, image→PDF). Redis is used only for cache/sessions/rate-limits.
 > Security model: **JWT** auth throughout; files encrypted at rest via **S3 SSE-S3** + TLS in transit (no KMS envelope encryption). Django kept private by **security-group rules**, not a separate private subnet.
 
 ---
@@ -85,7 +86,7 @@ flowchart TB
             m3[03 Teams]
             m4[04 Billing + GST]
             m5[05 Orchestration]
-            m6[06 PDF Tools · BullMQ]
+            m6[06 PDF Tools · RabbitMQ]
         end
         subgraph ADMB["/admin/* · hardened"]
             n1[07 AdminUser + TOTP]
@@ -357,22 +358,24 @@ flowchart TB
             ALB --> f3[ECS: api-node · Express]
         end
         subgraph INT["🔒 SG-restricted services (not on ALB)"]
-            f3 --> w1[ECS: workers-node<br/>BullMQ]
+            f3 --> w1[ECS: workers-node<br/>RabbitMQ consumers]
             f3 --> w2[ECS: api-django]
             w2 --> w3[ECS: celery-workers<br/>heavy image]
         end
         subgraph DATA["💾 DATA layer (SG-restricted)"]
             rds1[(RDS: node-db · encrypted)]
             rds2[(RDS: django-db · encrypted)]
-            ec[(ElastiCache Redis<br/>encrypted)]
+            mq[(🐰 Amazon MQ · RabbitMQ<br/>single job broker)]
+            ec[(ElastiCache Redis<br/>cache / sessions)]
             s3[(S3: uploads/results/exports<br/>SSE-S3 · 24h lifecycle)]
         end
     end
 
     f3 --> rds1
     f3 --> ec
+    f3 --> mq
     w2 --> rds2
-    w1 & w2 & w3 --> ec
+    w1 & w2 & w3 --> mq
     w3 --> s3
     f3 --> s3
     w3 -. "cloud OCR/translate APIs" .-> NET
@@ -383,127 +386,39 @@ flowchart TB
     classDef edge fill:#F1F5F9,stroke:#64748B,color:#1E293B;
     class f1,f2,f3 pub;
     class w1,w2,w3 priv;
-    class rds1,rds2,ec,s3 data;
+    class rds1,rds2,ec,s3,mq data;
     class CF,ALB,NET edge;
 ```
 
 ---
 
-## 8. Worker queues & autoscaling signal
+## 8. One queue for everything — RabbitMQ
+
+Every async task goes through **RabbitMQ**. The gateway publishes a job; the right worker pool consumes it. Node tools and Django/Celery share the same broker — nothing heavy runs inline in a request.
 
 ```mermaid
 flowchart LR
-    J([incoming job]) --> R{tier?}
-    R -- premium --> PQ[[priority queue]]
-    R -- free --> DQ[[default queue]]
+    GW[🚪 Express Gateway<br/>publishes job] --> MQ{{🐰 RabbitMQ<br/>single broker}}
 
-    PQ & DQ --> SPLIT{tool type}
-    SPLIT -- OCR/translate --> QA[(ocr-translate queue<br/>scales on depth)]
-    SPLIT -- merge/compress/edit --> QB[(pdf-tools queue · BullMQ)]
-    SPLIT -- LibreOffice/Ghostscript --> QC[(heavy queue<br/>LOW concurrency cap)]
+    MQ -- merge / compress / edit / convert --> NW[Node workers]
+    MQ -- OCR / translate / image→PDF --> CW[Celery workers]
 
-    QA --> AS{{autoscale ↑↓<br/>on queue depth}}
-    QB --> AS
-    QC --> AS
+    NW --> S3[(🪣 S3)]
+    CW --> S3
+    NW --> DONE[update JobRef → notify]
+    CW --> DONE
 
-    classDef q fill:#EDE9FE,stroke:#7C3AED,color:#4C1D95;
+    MQ -. "scale consumers<br/>on queue depth" .-> AS{{autoscale ↑↓}}
+
+    classDef gate fill:#4F46E5,stroke:#312E81,color:#fff;
+    classDef mq fill:#FDE68A,stroke:#D97706,color:#78350F;
+    classDef worker fill:#EDE9FE,stroke:#7C3AED,color:#4C1D95;
     classDef sig fill:#DCFCE7,stroke:#16A34A,color:#14532D;
-    class QA,QB,QC,PQ,DQ q;
+    class GW gate;
+    class MQ mq;
+    class NW,CW worker;
     class AS sig;
-```
-
----
-
-## 9. Build sequencing — the dependency timeline
-
-The free-tier product works end to end after Step 2–3; everything after layers on without touching the processing path.
-
-```mermaid
-gantt
-    title SlashifyTech build order (dependency-ordered)
-    dateFormat X
-    axisFormat %s
-
-    section Foundations
-    Step 0 · monorepo, CI/CD, bridge, JWT auth, BullMQ/Celery        :done, s0, 0, 2
-
-    section Free-tier core
-    Step 1 · auth, OCR + pre-processing, B2C dashboard              :active, s1, 2, 3
-    Step 2 · PDF suite + image→PDF + editor/camera                 :s2, 5, 3
-    Step 3 · Money — plans, Razorpay, GST, account settings        :s3, 8, 2
-
-    section Expansion
-    Step 4 · Teams — orgs, seats, invites, pooled billing          :s4, 10, 2
-    Step 5 · Premium engines (Vision/Textract, Google/DeepL)       :s5, 12, 1
-
-    section Staff plane
-    Step 6 · Admin backend + second frontend (dashboard last)      :s6, 13, 3
-
-    section Launch
-    Step 7 · Hardening, E2E, load, DPDP, pen test → GA             :crit, s7, 16, 2
-```
-
-```mermaid
-flowchart LR
-    S0([0 · Foundations]) --> S1([1 · Free core])
-    S1 --> S2([2 · PDF suite])
-    S2 --> S3([3 · Money])
-    S3 --> S4([4 · Teams])
-    S3 -.-> S5([5 · Premium])
-    S4 --> S6([6 · Admin])
-    S5 --> S6
-    S6 --> S7([7 · Hardening → GA])
-
-    S2 -. "🎉 free-tier product<br/>works end to end" .-> MILE{{MVP}}
-
-    classDef step fill:#4F46E5,stroke:#312E81,color:#fff;
-    classDef mile fill:#16A34A,stroke:#14532D,color:#fff;
-    class S0,S1,S2,S3,S4,S5,S6,S7 step;
-    class MILE mile;
-```
-
----
-
-## 10. Role ownership map (who builds what)
-
-```mermaid
-flowchart TB
-    subgraph FE["🎨 Frontend dev — critical path (2 apps, sequenced)"]
-        fe1[B2C · Steps 1–4]
-        fe2[Admin · Step 6 on template]
-    end
-    subgraph ND["🟩 Node dev — 2nd heaviest"]
-        nd1[gateway + auth + orchestration]
-        nd2[teams + billing]
-        nd3[entire admin backend]
-    end
-    subgraph DJ["🟪 Django dev — idle in 3–5 → lent to Node"]
-        dj1[OCR + translation + image→PDF]
-        dj2[premium adapters]
-    end
-    subgraph DO["🟦 DevOps — leads foundations, then floats"]
-        do1[infra + SG model + CI/CD + images]
-        do2[E2E/load harness + admin CRUD assist]
-    end
-
-    DJ -. "spare capacity Steps 3–5" .-> ND
-    DO -. "absorb admin CRUD Step 6" .-> FE
-    CONTRACT{{📜 OpenAPI contract<br/>= the only coordination tool<br/>no PM, no QA}}
-    FE --- CONTRACT
-    ND --- CONTRACT
-    DJ --- CONTRACT
-    DO --- CONTRACT
-
-    classDef fe fill:#EEF2FF,stroke:#4F46E5,color:#312E81;
-    classDef nd fill:#DCFCE7,stroke:#16A34A,color:#14532D;
-    classDef dj fill:#EDE9FE,stroke:#7C3AED,color:#4C1D95;
-    classDef do fill:#DBEAFE,stroke:#2563EB,color:#1E3A8A;
-    classDef con fill:#FEF9C3,stroke:#CA8A04,color:#713F12;
-    class fe1,fe2 fe;
-    class nd1,nd2,nd3 nd;
-    class dj1,dj2 dj;
-    class do1,do2 do;
-    class CONTRACT con;
+    class S3,DONE worker;
 ```
 
 ---
